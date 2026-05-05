@@ -32,16 +32,32 @@ PRIMARY_EMAIL=""
 WORKDIR=""
 REPORT_FILE=""
 SEARCH_CONCURRENCY="${SEARCH_CONCURRENCY:-4}"
+IGNORE_FILE=""
+STATUS_ONLY=false
+declare -a IGNORE_REPOS=()
+declare -a IGNORE_PATTERNS=()
+declare -a IGNORE_SECRET_LABELS=()
+declare -a IGNORE_REPO_PATTERN_COMBOS=()
 
 # --- Argument Parsing ---
 for arg in "$@"; do
     case "$arg" in
         --clone) CLONE_REPOS=true ;;
         --email=*) PRIMARY_EMAIL="${arg#*=}" ;;
+        --ignore-file=*) IGNORE_FILE="${arg#*=}" ;;
+        --ignore-repo=*) IGNORE_REPOS+=("${arg#*=}") ;;
+        --ignore-pattern=*) IGNORE_PATTERNS+=("${arg#*=}") ;;
+        --ignore-secret-label=*) IGNORE_SECRET_LABELS+=("${arg#*=}") ;;
+        --status) STATUS_ONLY=true ;;
         --help|-h)
-            echo "Usage: $0 <github-username> [--clone] [--email=primary@example.com]"
+            echo "Usage: $0 <github-username> [--clone] [--email=primary@example.com] [--status]"
             echo "  --clone              Clones repos and scans git history (slower, more thorough)"
             echo "  --email=addr         Primary email address for consistency checks"
+            echo "  --status             Show status updates with reduced finding noise"
+            echo "  --ignore-file=path   Ignore config file for known false positives"
+            echo "  --ignore-repo=name   Ignore findings from specific repo (repeatable)"
+            echo "  --ignore-pattern=p   Ignore specific filename/secret pattern (repeatable)"
+            echo "  --ignore-secret-label=l  Ignore specific secret label (repeatable)"
             exit 0
             ;;
         *) USERNAME="$arg" ;;
@@ -50,7 +66,7 @@ done
 
 if [[ -z "$USERNAME" ]]; then
     echo -e "${RED}Error: Please provide a GitHub username as an argument.${NC}"
-    echo "Usage: $0 <github-username> [--clone] [--email=primary@example.com]"
+    echo "Usage: $0 <github-username> [--clone] [--email=primary@example.com] [--status]"
     exit 1
 fi
 
@@ -64,6 +80,11 @@ mkdir -p "$TMP_DIR"
 if [[ -n "$PRIMARY_EMAIL" ]]; then
     echo -e "${GREEN}[+] Primary email for consistency checks: $PRIMARY_EMAIL${NC}"
 fi
+
+if $STATUS_ONLY; then
+    echo -e "${GREEN}[+] Status mode enabled (reduced finding noise)${NC}"
+fi
+
 
 # GitHub API Header
 AUTH_HEADER=""
@@ -130,6 +151,77 @@ wait_for_search_slot() {
         wait -n || true
     done
 }
+
+array_contains() {
+    local needle="$1"
+    shift
+    local item
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+load_ignore_file() {
+    local path="$1"
+    [[ -f "$path" ]] || return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line%$'\r'}"
+        [[ -z "$line" ]] && continue
+
+        case "$line" in
+            repo:*) IGNORE_REPOS+=("${line#repo:}") ;;
+            pattern:*) IGNORE_PATTERNS+=("${line#pattern:}") ;;
+            secret_label:*) IGNORE_SECRET_LABELS+=("${line#secret_label:}") ;;
+            repo_pattern:*) IGNORE_REPO_PATTERN_COMBOS+=("${line#repo_pattern:}") ;;
+        esac
+    done < "$path"
+}
+
+should_ignore_sensitive_finding() {
+    local repo_name="$1"
+    local pattern="$2"
+
+    if array_contains "$repo_name" "${IGNORE_REPOS[@]}"; then
+        return 0
+    fi
+    if array_contains "$pattern" "${IGNORE_PATTERNS[@]}"; then
+        return 0
+    fi
+    if array_contains "${repo_name}:${pattern}" "${IGNORE_REPO_PATTERN_COMBOS[@]}"; then
+        return 0
+    fi
+    return 1
+}
+
+should_ignore_secret_finding() {
+    local label="$1"
+    local pattern="$2"
+
+    if array_contains "$label" "${IGNORE_SECRET_LABELS[@]}"; then
+        return 0
+    fi
+    if array_contains "$pattern" "${IGNORE_PATTERNS[@]}"; then
+        return 0
+    fi
+    return 1
+}
+
+status_msg() {
+    local msg="$1"
+    echo -e "  ${CYAN}[status] ${msg}${NC}"
+}
+
+if [[ -z "$IGNORE_FILE" ]] && [[ -f ".github-recon-ignore" ]]; then
+    IGNORE_FILE=".github-recon-ignore"
+fi
+
+if [[ -n "$IGNORE_FILE" ]]; then
+    load_ignore_file "$IGNORE_FILE"
+    echo -e "${GREEN}[+] Ignore rules loaded from: $IGNORE_FILE${NC}"
+fi
 
 # Validate whether string is valid JSON
 is_valid_json() {
@@ -364,6 +456,7 @@ cat >> "$REPORT_FILE" << EOF
 EOF
 
 FOUND_SENSITIVE=0
+SUPPRESSED_SENSITIVE=0
 
 scan_sensitive_repo() {
     local repo_name="$1"
@@ -396,7 +489,15 @@ if [[ "$REPO_COUNT" -gt 0 ]]; then
         [[ -e "$result_file" ]] || continue
         while IFS=$'\t' read -r repo_name pattern count; do
             [[ -z "$repo_name" ]] && continue
-            echo -e "  ${RED}[!] ${repo_name}: ${pattern} found (${count}x)${NC}"
+
+            if should_ignore_sensitive_finding "$repo_name" "$pattern"; then
+                SUPPRESSED_SENSITIVE=$((SUPPRESSED_SENSITIVE + 1))
+                continue
+            fi
+
+            if ! $STATUS_ONLY; then
+                echo -e "  ${RED}[!] ${repo_name}: ${pattern} found (${count}x)${NC}"
+            fi
             echo "- 🔴 **${repo_name}**: \`${pattern}\` found (${count}x)" >> "$REPORT_FILE"
             FOUND_SENSITIVE=$((FOUND_SENSITIVE + 1))
         done < "$result_file"
@@ -406,6 +507,10 @@ fi
 if [[ "$FOUND_SENSITIVE" -eq 0 ]]; then
     echo -e "  ${GREEN}No obviously sensitive files found${NC}"
     echo "✅ No obviously sensitive files found in repos." >> "$REPORT_FILE"
+fi
+if [[ "$SUPPRESSED_SENSITIVE" -gt 0 ]]; then
+    status_msg "Suppressed ${SUPPRESSED_SENSITIVE} sensitive-file finding(s) via ignore rules"
+    echo "Suppressed ${SUPPRESSED_SENSITIVE} sensitive-file finding(s) via ignore rules." >> "$REPORT_FILE"
 fi
 echo "" >> "$REPORT_FILE"
 
@@ -479,6 +584,7 @@ cat >> "$REPORT_FILE" << EOF
 EOF
 
 FOUND_SECRETS=0
+SUPPRESSED_SECRETS=0
 
 for label in "${SECRET_PATTERN_LABELS[@]}"; do
     wait_for_search_slot
@@ -494,7 +600,15 @@ for label in "${SECRET_PATTERN_LABELS[@]}"; do
 
     while IFS=$'\t' read -r found_label pattern count repos_with_secret; do
         [[ -z "$found_label" ]] && continue
-        echo -e "  ${RED}[!] ${found_label}: ${count} matches in [${repos_with_secret}]${NC}"
+
+        if should_ignore_secret_finding "$found_label" "$pattern"; then
+            SUPPRESSED_SECRETS=$((SUPPRESSED_SECRETS + 1))
+            continue
+        fi
+
+        if ! $STATUS_ONLY; then
+            echo -e "  ${RED}[!] ${found_label}: ${count} matches in [${repos_with_secret}]${NC}"
+        fi
         echo "- 🔴 **${found_label}** (\`${pattern}\`): ${count} matches in ${repos_with_secret}" >> "$REPORT_FILE"
         FOUND_SECRETS=$((FOUND_SECRETS + 1))
     done < "$pattern_result_file"
@@ -503,6 +617,10 @@ done
 if [[ "$FOUND_SECRETS" -eq 0 ]]; then
     echo -e "  ${GREEN}No secret patterns found in code${NC}"
     echo "✅ No secret patterns found in public code." >> "$REPORT_FILE"
+fi
+if [[ "$SUPPRESSED_SECRETS" -gt 0 ]]; then
+    status_msg "Suppressed ${SUPPRESSED_SECRETS} secret finding(s) via ignore rules"
+    echo "Suppressed ${SUPPRESSED_SECRETS} secret finding(s) via ignore rules." >> "$REPORT_FILE"
 fi
 echo "" >> "$REPORT_FILE"
 
