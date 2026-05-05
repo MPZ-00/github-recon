@@ -31,6 +31,7 @@ USERNAME=""
 PRIMARY_EMAIL=""
 WORKDIR=""
 REPORT_FILE=""
+SEARCH_CONCURRENCY="${SEARCH_CONCURRENCY:-4}"
 
 # --- Argument Parsing ---
 for arg in "$@"; do
@@ -56,6 +57,8 @@ fi
 WORKDIR="/tmp/github-recon-${USERNAME}"
 REPORT_FILE="${WORKDIR}/recon-report.md"
 mkdir -p "$WORKDIR"
+TMP_DIR="${WORKDIR}/.tmp"
+mkdir -p "$TMP_DIR"
 
 # Email consistency info in report
 if [[ -n "$PRIMARY_EMAIL" ]]; then
@@ -71,11 +74,61 @@ fi
 
 api_get() {
     local url="$1"
-    if [[ -n "$AUTH_HEADER" ]]; then
-        curl -sL -H "$AUTH_HEADER" -H "Accept: application/vnd.github+json" "$url"
-    else
-        curl -sL -H "Accept: application/vnd.github+json" "$url"
-    fi
+    local attempt=1
+    local max_attempts=5
+    local response_body=""
+
+    while [[ $attempt -le $max_attempts ]]; do
+        local headers_file body_file http_code retry_after rate_reset wait_seconds
+        headers_file=$(mktemp)
+        body_file=$(mktemp)
+
+        if [[ -n "$AUTH_HEADER" ]]; then
+            http_code=$(curl -sSL -D "$headers_file" -o "$body_file" -w '%{http_code}' -H "$AUTH_HEADER" -H "Accept: application/vnd.github+json" "$url" || true)
+        else
+            http_code=$(curl -sSL -D "$headers_file" -o "$body_file" -w '%{http_code}' -H "Accept: application/vnd.github+json" "$url" || true)
+        fi
+
+        response_body=$(cat "$body_file")
+        retry_after=$(awk 'BEGIN {IGNORECASE=1} /^Retry-After:/ {print $2}' "$headers_file" | tail -n1 | tr -d '\r')
+        rate_reset=$(awk 'BEGIN {IGNORECASE=1} /^X-RateLimit-Reset:/ {print $2}' "$headers_file" | tail -n1 | tr -d '\r')
+
+        rm -f "$headers_file" "$body_file"
+
+        if [[ "$http_code" =~ ^2 ]]; then
+            printf '%s' "$response_body"
+            return 0
+        fi
+
+        if [[ "$http_code" == "403" || "$http_code" == "429" ]]; then
+            if [[ -n "$retry_after" ]]; then
+                wait_seconds="$retry_after"
+            elif [[ -n "$rate_reset" ]]; then
+                wait_seconds=$(( rate_reset - $(date +%s) ))
+                if [[ "$wait_seconds" -lt 1 ]]; then
+                    wait_seconds=1
+                fi
+            else
+                wait_seconds=$(( attempt * 2 ))
+            fi
+
+            echo -e "${YELLOW}[rate-limit] Retrying ${url} in ${wait_seconds}s (attempt ${attempt}/${max_attempts})${NC}" >&2
+            sleep "$wait_seconds"
+            attempt=$((attempt + 1))
+            continue
+        fi
+
+        printf '%s' "$response_body"
+        return 0
+    done
+
+    printf '%s' "$response_body"
+}
+
+wait_for_search_slot() {
+    while [[ $(jobs -pr | wc -l) -ge $SEARCH_CONCURRENCY ]]; do
+        wait -n || true
+    done
 }
 
 # Validate whether string is valid JSON
@@ -312,23 +365,42 @@ EOF
 
 FOUND_SENSITIVE=0
 
-if [[ "$REPO_COUNT" -gt 0 ]]; then
-for repo_name in $(echo "$REPOS_JSON" | jq -r '[.[] | objects] | .[].name'); do
+scan_sensitive_repo() {
+    local repo_name="$1"
+    local safe_repo_name="${repo_name//[^A-Za-z0-9._-]/_}"
+    local repo_result_file="${TMP_DIR}/sensitive-${safe_repo_name}.txt"
+
+    : > "$repo_result_file"
+
     for pattern in "${SENSITIVE_PATTERNS[@]}"; do
-        # GitHub code search API
         SEARCH_RESULT=$(api_get "https://api.github.com/search/code?q=filename:${pattern}+repo:${USERNAME}/${repo_name}" 2>/dev/null || echo '{"total_count":0}')
         COUNT=$(echo "$SEARCH_RESULT" | jq -r '.total_count // 0')
-        
+
         if [[ "$COUNT" -gt 0 ]]; then
-            echo -e "  ${RED}[!] ${repo_name}: ${pattern} found (${COUNT}x)${NC}"
-            echo "- 🔴 **${repo_name}**: \`${pattern}\` found (${COUNT}x)" >> "$REPORT_FILE"
-            FOUND_SENSITIVE=$((FOUND_SENSITIVE + 1))
+            printf '%s\t%s\t%s\n' "$repo_name" "$pattern" "$COUNT" >> "$repo_result_file"
         fi
     done
-    
-    # Rate limit protection
-    sleep 0.5
-done
+
+    return 0
+}
+
+if [[ "$REPO_COUNT" -gt 0 ]]; then
+    while IFS= read -r repo_name; do
+        wait_for_search_slot
+        scan_sensitive_repo "$repo_name" &
+    done < <(echo "$REPOS_JSON" | jq -r '[.[] | objects] | .[].name')
+
+    wait
+
+    for result_file in "$TMP_DIR"/sensitive-*.txt; do
+        [[ -e "$result_file" ]] || continue
+        while IFS=$'\t' read -r repo_name pattern count; do
+            [[ -z "$repo_name" ]] && continue
+            echo -e "  ${RED}[!] ${repo_name}: ${pattern} found (${count}x)${NC}"
+            echo "- 🔴 **${repo_name}**: \`${pattern}\` found (${count}x)" >> "$REPORT_FILE"
+            FOUND_SENSITIVE=$((FOUND_SENSITIVE + 1))
+        done < "$result_file"
+    done
 fi
 
 if [[ "$FOUND_SENSITIVE" -eq 0 ]]; then
@@ -362,6 +434,45 @@ declare -A SECRET_PATTERNS=(
     ["Twilio"]="TWILIO"
 )
 
+SECRET_PATTERN_LABELS=(
+    "AWS Access Key"
+    "GitHub Token"
+    "GitHub OAuth"
+    "Slack Token"
+    "Slack Webhook"
+    "Anthropic API Key"
+    "OpenAI API Key"
+    "Stripe Key"
+    "Stripe Test Key"
+    "Private Key"
+    "Password Assignment"
+    "DB Connection String"
+    "MongoDB URI"
+    "JWT Secret"
+    "API_KEY variable"
+    "Sendgrid"
+    "Twilio"
+)
+
+scan_secret_pattern() {
+    local label="$1"
+    local pattern="${SECRET_PATTERNS[$label]}"
+    local safe_label="${label//[^A-Za-z0-9._-]/_}"
+    local pattern_result_file="${TMP_DIR}/secret-${safe_label}.txt"
+
+    : > "$pattern_result_file"
+
+    SEARCH_RESULT=$(api_get "https://api.github.com/search/code?q=${pattern}+user:${USERNAME}" 2>/dev/null || echo '{"total_count":0}')
+    COUNT=$(echo "$SEARCH_RESULT" | jq -r '.total_count // 0')
+
+    if [[ "$COUNT" -gt 0 ]]; then
+        REPOS_WITH_SECRET=$(echo "$SEARCH_RESULT" | jq -r '.items[].repository.name' 2>/dev/null | sort -u | tr '\n' ', ' | sed 's/,$//')
+        printf '%s\t%s\t%s\t%s\n' "$label" "$pattern" "$COUNT" "$REPOS_WITH_SECRET" >> "$pattern_result_file"
+    fi
+
+    return 0
+}
+
 cat >> "$REPORT_FILE" << EOF
 ## 5. Secret pattern scan
 
@@ -369,20 +480,24 @@ EOF
 
 FOUND_SECRETS=0
 
-for label in "${!SECRET_PATTERNS[@]}"; do
-    pattern="${SECRET_PATTERNS[$label]}"
-    SEARCH_RESULT=$(api_get "https://api.github.com/search/code?q=${pattern}+user:${USERNAME}" 2>/dev/null || echo '{"total_count":0}')
-    COUNT=$(echo "$SEARCH_RESULT" | jq -r '.total_count // 0')
-    
-    if [[ "$COUNT" -gt 0 ]]; then
-        REPOS_WITH_SECRET=$(echo "$SEARCH_RESULT" | jq -r '.items[].repository.name' 2>/dev/null | sort -u | tr '\n' ', ' | sed 's/,$//')
-        echo -e "  ${RED}[!] ${label}: ${COUNT} matches in [${REPOS_WITH_SECRET}]${NC}"
-        echo "- 🔴 **${label}** (\`${pattern}\`): ${COUNT} matches in ${REPOS_WITH_SECRET}" >> "$REPORT_FILE"
+for label in "${SECRET_PATTERN_LABELS[@]}"; do
+    wait_for_search_slot
+    scan_secret_pattern "$label" &
+done
+
+wait
+
+for label in "${SECRET_PATTERN_LABELS[@]}"; do
+    safe_label="${label//[^A-Za-z0-9._-]/_}"
+    pattern_result_file="${TMP_DIR}/secret-${safe_label}.txt"
+    [[ -e "$pattern_result_file" ]] || continue
+
+    while IFS=$'\t' read -r found_label pattern count repos_with_secret; do
+        [[ -z "$found_label" ]] && continue
+        echo -e "  ${RED}[!] ${found_label}: ${count} matches in [${repos_with_secret}]${NC}"
+        echo "- 🔴 **${found_label}** (\`${pattern}\`): ${count} matches in ${repos_with_secret}" >> "$REPORT_FILE"
         FOUND_SECRETS=$((FOUND_SECRETS + 1))
-    fi
-    
-    # Rate limit protection (search API is strictly limited)
-    sleep 2
+    done < "$pattern_result_file"
 done
 
 if [[ "$FOUND_SECRETS" -eq 0 ]]; then
