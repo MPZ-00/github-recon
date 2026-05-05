@@ -90,9 +90,9 @@ repo_pattern:my-demo-repo:.env
 ```
 
 ## Output
-- Working directory: /tmp/github-recon-<username>
-- Main report: /tmp/github-recon-<username>/recon-report.md
-- Deep scan leak reports (if enabled): /tmp/github-recon-<username>/gitleaks-<repo>.json
+- Working directory: /tmp/github-recon-\<username>
+- Main report: /tmp/github-recon-\<username>/recon-report.md
+- Deep scan leak reports (if enabled): /tmp/github-recon-\<username>/gitleaks-\<repo>.json
 
 ## Notes
 - This tool is designed for auditing your own assets and improving operational security.
