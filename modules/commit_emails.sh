@@ -39,18 +39,17 @@ while IFS= read -r email; do
 
     REPOS=$(printf '%s\n' "$EMAIL_REPO_PAIRS" | awk -F'\t' -v e="$email" '$1 == e {print $2}' | sort -u | tr '\n' ',' | sed 's/,$//')
 
-    emit_finding "commit_email" "high" \
-        "Personal email exposed in commits" \
-        "Email <${email}> found in public commit history" \
-        "email=${email}" \
-        "repos=${REPOS}"
-
-    if [[ -n "${PRIMARY_EMAIL:-}" && "$email" != "$PRIMARY_EMAIL" ]]; then
-        emit_finding "email_mismatch" "medium" \
-            "Commit email differs from primary" \
-            "Email <${email}> does not match configured primary <${PRIMARY_EMAIL}>" \
-            "email=${email}" \
-            "primary_email=${PRIMARY_EMAIL}" \
-            "repos=${REPOS}"
+    if [[ -n "${PRIMARY_EMAIL:-}" && "$email" == "$PRIMARY_EMAIL" ]]; then
+        # Expected address — still public exposure but not a surprise leak.
+        emit_finding "commit_emails" "info" "email_leak" \
+            "commits" "$email" \
+            "Primary email visible in public commit history (expected)" \
+            "https://github.com/${USERNAME}"
+    else
+        # Any non-noreply email that isn't the declared primary is a real leak.
+        emit_finding "commit_emails" "high" "email_leak" \
+            "commits" "$email" \
+            "Personal email exposed in public commits (repos: ${REPOS})" \
+            "https://github.com/${USERNAME}"
     fi
 done <<< "$UNIQUE_EMAILS"

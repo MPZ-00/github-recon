@@ -65,7 +65,7 @@ touch "$FINDINGS_FILE"
 
 load_ignore_file ".github-recon-ignore"
 
-log_normal "${BOLD}GitHub Recon: ${USERNAME}${NC} (${LOG_LEVEL} mode)"
+log_normal "${BOLD}${CYAN}GitHub Recon:${NC} ${BOLD}${USERNAME}${NC} ${DIM}(${LOG_LEVEL} mode)${NC}"
 
 BASH_MODULES=(
     profile repos commit_emails sensitive_files secret_patterns
@@ -84,7 +84,7 @@ for mod in "${BASH_MODULES[@]}"; do
     MOD="$SCRIPT_DIR/modules/${mod}.sh"
     if [[ -f "$MOD" ]]; then
         log_progress "$N" "$TOTAL" "Scanning ${mod//_/ }..."
-        bash "$MOD" >> "$FINDINGS_FILE" 2>&1 || log_verbose "Module $mod exited non-zero"
+        bash "$MOD" >> "$FINDINGS_FILE" || log_verbose "Module $mod exited non-zero"
     else
         log_verbose "Skipping $mod (not found)"
     fi
@@ -95,7 +95,7 @@ for scanner in "${PYTHON_SCANNERS[@]}"; do
     SCAN="$SCRIPT_DIR/scanners/${scanner}.py"
     if [[ -f "$SCAN" ]] && command -v python3 &>/dev/null; then
         log_progress "$N" "$TOTAL" "Scanning ${scanner}..."
-        python3 "$SCAN" "$USERNAME" --log-level="$LOG_LEVEL" >> "$FINDINGS_FILE" 2>&1 || log_verbose "Scanner $scanner exited non-zero"
+        python3 "$SCAN" "$USERNAME" --log-level="$LOG_LEVEL" >> "$FINDINGS_FILE" || log_verbose "Scanner $scanner exited non-zero"
     else
         log_verbose "Skipping $scanner (not found or python3 unavailable)"
     fi
@@ -107,7 +107,7 @@ if [[ "$CLONE_MODE" == true ]]; then
         MOD="$SCRIPT_DIR/modules/${mod}.sh"
         if [[ -f "$MOD" ]]; then
             log_progress "$N" "$TOTAL" "Deep scanning (git clone)..."
-            bash "$MOD" >> "$FINDINGS_FILE" 2>&1 || log_verbose "Module $mod exited non-zero"
+            bash "$MOD" >> "$FINDINGS_FILE" || log_verbose "Module $mod exited non-zero"
         fi
     done
 fi
@@ -124,13 +124,17 @@ log_normal "Report:        $REPORT_FILE"
     echo "## Summary"
     echo ""
     if [[ -s "$FINDINGS_FILE" ]]; then
-        jq -r '"| " + .severity + " | " + .module + " | " + .type + " | " + .detail + " |"' "$FINDINGS_FILE" | \
-        { echo "| Severity | Module | Type | Detail |"; echo "|----------|--------|------|--------|"; cat; }
+        { echo "| Severity | Module | Type | Target | Detail |"
+          echo "|----------|--------|------|--------|--------|"
+          jq -r 'select(.module != null) | "| \(.severity) | \(.module) | \(.type) | \(.target // .repo // "-") | \(.detail) |"' "$FINDINGS_FILE"
+        }
     else
         echo "No findings."
     fi
 } > "$REPORT_FILE"
 
 if [[ "$LOG_LEVEL" == "quiet" ]]; then
-    jq -s '{total: length, by_severity: (group_by(.severity) | map({(.[0].severity): length}) | add // {}), findings: .}' "$FINDINGS_FILE"
+    # Filter to valid JSON objects only before aggregating
+    grep -E '^\{' "$FINDINGS_FILE" | \
+        jq -s '{total: length, by_severity: (group_by(.severity) | map({(.[0].severity): length}) | add // {}), findings: .}'
 fi
